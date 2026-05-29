@@ -2,42 +2,57 @@ import streamlit as st
 import ezdxf
 import io
 import json
+from openai import OpenAI
+from pydantic import BaseModel, Field
+from typing import List
 
 # =====================================================================
-# CONFIGURACIÓN DE LA PÁGINA
+# CONFIGURACIÓN DE LA PÁGINA E INTERFAZ
 # =====================================================================
-st.set_page_config(
-    page_title="AI Electric Pro - Generador Automatizado",
-    page_icon="⚡",
-    layout="wide"
-)
+st.set_page_config(page_title="AI Electric Pro", page_icon="⚡", layout="wide")
 
 st.title("⚡ AI Electric Pro")
 st.subheader("Plataforma automatizada de diseño eléctrico asistida por IA")
-st.write("Sube el plano de arquitectura en formato DXF para que el sistema identifique los recintos y diseñe el proyecto eléctrico.")
 
 # =====================================================================
-# BARRA LATERAL (CONFIGURACIÓN Y CARGA)
+# MODELOS DE DATOS PARA FORZAR LA RESPUESTA ESTRUCTURADA DE LA IA
+# =====================================================================
+class ElementoElectrico(BaseModel):
+    elemento: str = Field(description="Tipo de elemento: 'LUMINARIA', 'ENCHUFE', 'INTERRUPTOR' o 'TABLERO'")
+    x: float = Field(description="Coordenada X exacta para ubicar el elemento")
+    y: float = Field(description="Coordenada Y exacta para ubicar el elemento")
+    capa: str = Field(description="Nombre de la capa destino, ej: 'ELEC_LUMINARIAS', 'ELEC_ENCHUFES'")
+
+class PropuestaProyecto(BaseModel):
+    razonamiento_agente: str = Field(description="Breve justificación técnica del diseño propuesto")
+    elementos_a_dibujar: List[ElementoElectrico]
+
+# =====================================================================
+# BARRA LATERAL: ENTRADAS Y LLAVES
 # =====================================================================
 with st.sidebar:
-    st.header("1. Configuración")
-    # Selector de normativa (Pensando en el futuro escalable)
-    normativa = st.selectbox(
-        "Selecciona la Normativa Eléctrica",
-        ["Norma SEC (Chile)", "NEC (Internacional)", "NOM-001 (México)"]
-    )
+    st.header("1. Credenciales")
+    api_key = st.text_input("Introduce tu OpenAI API Key", type="password")
     
     st.write("---")
-    st.header("2. Archivo de Entrada")
+    st.header("2. Configuración")
+    normativa = st.selectbox("Normativa Eléctrica", ["Norma SEC (Chile)", "NEC (USA/Internacional)", "NOM-001 (México)"])
+    
+    st.write("---")
+    st.header("3. Archivo de Entrada")
     archivo_subido = st.file_uploader("Sube tu plano de arquitectura (.dxf)", type=["dxf"])
 
 # =====================================================================
-# PANEL CENTRAL (PROCESAMIENTO)
+# FLUJO PRINCIPAL DE LA APLICACIÓN
 # =====================================================================
 if archivo_subido is not None:
-    st.success("¡Archivo cargado con éxito en la plataforma!")
+    if not api_key:
+        st.warning("⚠️ Por favor, introduce tu OpenAI API Key en la barra lateral para activar el Agente de IA.")
+        st.stop()
+        
+    st.success("¡Archivo de arquitectura cargado correctamente!")
     
-    # Leer el archivo DXF desde la memoria de Streamlit sin guardarlo en disco
+    # Leer el DXF de la memoria
     bytes_data = archivo_subido.read()
     string_data = bytes_data.decode("utf-8", errors="ignore")
     
@@ -46,106 +61,103 @@ if archivo_subido is not None:
         msp = doc.modelspace()
         
         # -------------------------------------------------------------
-        # MÓDULO DE RECONOCIMIENTO: SCRAPPER DE PYTHON
+        # PASO 1: SCRAPPER GEOMÉTRICO (PYTHON)
         # -------------------------------------------------------------
-        with st.spinner("Python ejecutando el Scrapper Geométrico..."):
-            
-            # Extraer textos (Habitaciones, notas)
-            textos_raspados = []
-            for t in msp.query('TEXT MTEXT'):
-                if t.dxf.text.strip():
-                    textos_raspados.append({
-                        "texto": t.dxf.text.strip(),
-                        "x": round(t.dxf.insert.x, 2),
-                        "y": round(t.dxf.insert.y, 2),
-                        "capa": t.dxf.layer
-                    })
-            
-            # Extraer bloques (Artefactos, muebles, sanitarios)
-            bloques_raspados = []
-            for b in msp.query('INSERT'):
-                bloques_raspados.append({
-                    "nombre_bloque": b.dxf.name,
-                    "x": round(b.dxf.insert.x, 2),
-                    "y": round(b.dxf.insert.y, 2),
-                    "capa": b.dxf.layer
+        textos_raspados = []
+        for t in msp.query('TEXT MTEXT'):
+            if t.dxf.text.strip():
+                textos_raspados.append({
+                    "texto": t.dxf.text.strip(),
+                    "x": round(t.dxf.insert.x, 2),
+                    "y": round(t.dxf.insert.y, 2)
                 })
-        
-        # Crear el JSON estructurado para el Agente de IA
+                
         datos_para_ia = {
-            "archivo": archivo_subido.name,
-            "total_textos_detectados": len(textos_raspados),
-            "total_bloques_detectados": len(bloques_raspados),
-            "datos_scrapper": {
-                "textos": textos_raspados,
-                "bloques": bloques_raspados
-            }
+            "normativa_solicitada": normativa,
+            "elementos_arquitectura": textos_raspados
         }
-
-        # Opciones de visualización mediante Pestañas (Tabs)
-        tab1, tab2, tab3 = st.tabs(["📊 Datos del Scrapper (Python)", "🧠 Cerebro del Agente (IA)", "💾 Descargar Resultado"])
+        
+        tab1, tab2, tab3 = st.tabs(["📊 Scrapper (Python)", "🧠 Agente de IA", "💾 Descargar Plano"])
         
         with tab1:
-            st.write("### Datos extraídos por Python listos para enviar a la IA:")
-            
-            # Mostrar métricas rápidas
-            col1, col2 = st.columns(2)
-            col1.metric("Textos Encontrados", len(textos_raspados))
-            col2.metric("Bloques/Muebles Encontrados", len(bloques_raspados))
-            
-            # Mostrar el JSON que leerá la IA
+            st.write("### Datos extraídos listos para enviar al Agente:")
+            st.metric("Textos de referencia encontrados", len(textos_raspados))
             st.json(datos_para_ia)
             
         with tab2:
-            st.write("### Razonamiento y Clasificación del Agente de IA")
-            st.info("Aquí el Agente de IA leerá el JSON anterior, cruzará las coordenadas de los textos con los bloques y clasificará las habitaciones de forma inteligente.")
+            st.write("### Análisis del Agente de IA en tiempo real")
             
-            # Simulador del botón que llamará a la API de Inteligencia Artificial
-            if st.button("Iniciar Detección y Diseño con IA"):
-                with st.spinner("El Agente de IA está analizando los espacios y aplicando normativas..."):
+            if st.button("🚀 Iniciar Diseño Inteligente"):
+                with st.spinner("El Agente de IA está calculando la distribución eléctrica..."):
                     
-                    # Aquí irá tu llamada real a OpenAI/Anthropic pasando 'datos_para_ia'
-                    # Por ahora simulamos la respuesta estructurada que te dará el agente:
-                    simulacion_respuesta_ia = {
-                        "clasificacion_recintos": [
-                            {"id": 1, "tipo": "Dormitorio Principal", "ancla_texto": "Dorm. 1", "coordenadas_aprox": [10.5, 5.2]},
-                            {"id": 2, "tipo": "Baño", "ancla_texto": "Baño", "coordenadas_aprox": [14.2, 3.1]}
+                    # Conectar con la API de OpenAI usando el cliente oficial
+                    client = OpenAI(api_key=api_key)
+                    
+                    prompt_sistema = (
+                        "Eres un ingeniero eléctrico experto senior. Tu tarea es recibir las coordenadas de los textos "
+                        "de un plano de arquitectura, identificar qué habitaciones existen y proponer la ubicación exacta (X, Y) "
+                        "de las luminarias (idealmente en el centro o cerca del texto descriptivo), interruptores (cerca de los accesos) "
+                        "y enchufes según la normativa seleccionada. Debes devolver estrictamente el formato estructurado solicitado."
+                    )
+                    
+                    # Llamada al modelo con Structured Outputs (Garantiza respuesta JSON perfecta)
+                    completion = client.beta.chat.completions.parse(
+                        model="gpt-4o-mini", # Usamos mini por coste y velocidad, puedes cambiar a gpt-4o
+                        messages=[
+                            {"role": "system", "content": prompt_sistema},
+                            {"role": "user", "content": json.dumps(datos_para_ia)}
                         ],
-                        "propuesta_electrica": [
-                            {"elemento": "Interruptor 9/12", "x": 10.6, "y": 5.0, "capa": "ELEC_INTERRUPTORES"},
-                            {"elemento": "Centro de Luz LED", "x": 12.0, "y": 6.5, "capa": "ELEC_LUMINARIAS"},
-                            {"elemento": "Enchufe Doble 10A", "x": 9.2, "y": 5.2, "capa": "ELEC_ENCHUFES"}
-                        ]
-                    }
+                        response_format=PropuestaProyecto,
+                    )
                     
-                    st.success("¡Análisis de IA Completado!")
-                    st.write("#### Plan de diseño generado por el Agente:")
-                    st.json(simulacion_respuesta_ia)
+                    respuesta_ia = completion.choices[0].message.parsed
                     
-                    # Guardamos la simulación en el estado de la app para habilitar el paso 3
-                    st.session_state['proyecto_listo'] = True
+                    # Guardar la respuesta en el estado global de la sesión
+                    st.session_state['respuesta_ia'] = respuesta_ia
+                    st.success("¡El Agente de IA ha terminado el diseño!")
                     
-        with tab3:
-            st.write("### Exportar Proyecto Eléctrico")
-            if st.session_state.get('proyecto_listo', False):
-                st.write("La IA ha insertado los nuevos elementos en las capas eléctricas correspondientes.")
+            # Si el análisis ya se ejecutó, mostrar los resultados
+            if 'respuesta_ia' in st.session_state:
+                res = st.session_state['respuesta_ia']
+                st.info(f"**Justificación técnica del Agente:** {res.razonamiento_agente}")
+                st.write("#### Elementos Eléctricos Propuestos:")
+                st.write(res.elementos_a_dibujar)
                 
-                # Convertir el archivo DXF modificado a bytes para la descarga
+        with tab3:
+            st.write("### Inyección geométrica y descarga")
+            if 'respuesta_ia' in st.session_state:
+                res = st.session_state['respuesta_ia']
+                
+                # -------------------------------------------------------------
+                # PASO 3: DIBUJAR DE VUELTA EN EL DXF (PYTHON)
+                # -------------------------------------------------------------
+                # Recorrer lo que dictaminó la IA y dibujarlo físicamente en el plano original
+                for item in res.elementos_a_dibujar:
+                    if item.elemento == "LUMINARIA":
+                        # Dibuja un círculo amarillo para la lámpara
+                        msp.add_circle(center=(item.x, item.y), radius=0.15, dxfattribs={'layer': item.capa, 'color': 2})
+                    elif item.elemento == "ENCHUFE":
+                        # Dibuja un pequeño cuadrado para el enchufe
+                        msp.add_lwpolyline([(item.x-0.1, item.y-0.1), (item.x+0.1, item.y-0.1), (item.x+0.1, item.y+0.1), (item.x-0.1, item.y+0.1)], close=True, dxfattribs={'layer': item.capa, 'color': 4})
+                    else:
+                        # Puntos genéricos para otros elementos
+                        msp.add_point(location=(item.x, item.y), dxfattribs={'layer': item.capa, 'color': 1})
+                
+                # Preparar el archivo modificado para la descarga
                 out_stream = io.StringIO()
                 doc.write(out_stream)
                 dxf_bytes = out_stream.getvalue().encode()
                 
                 st.download_button(
-                    label="⬇️ Descargar Plano Eléctrico Final (.dxf)",
+                    label="⬇️ Descargar Plano Eléctrico Terminado (.dxf)",
                     data=dxf_bytes,
-                    file_name=f"ELEC_{archivo_subido.name}",
+                    file_name=f"PROYECTO_ELEC_{archivo_subido.name}",
                     mime="application/dxf"
                 )
             else:
-                st.warning("Primero debes ejecutar el análisis del Agente de IA en la pestaña anterior.")
-
+                st.warning("Debes ejecutar el diseño del Agente de IA en la pestaña anterior para generar el archivo.")
+                
     except Exception as e:
-        st.error(f"Error al procesar el archivo DXF: {e}")
-
+        st.error(f"Error crítico en el procesamiento: {e}")
 else:
-    st.info("👋 Por favor, sube un archivo DXF en la barra lateral para comenzar la demostración.")
+    st.info("👋 Sube un archivo DXF en la barra lateral e ingresa tu API Key para ver la magia en acción.")
